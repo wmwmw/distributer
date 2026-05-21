@@ -1,6 +1,8 @@
 defmodule DistributerWeb.Router do
   use DistributerWeb, :router
 
+  import DistributerWeb.UserAuth
+
   pipeline :browser do
     plug :accepts, ["html"]
     plug :fetch_session
@@ -8,30 +10,65 @@ defmodule DistributerWeb.Router do
     plug :put_root_layout, html: {DistributerWeb.Layouts, :root}
     plug :protect_from_forgery
     plug :put_secure_browser_headers
+    plug :fetch_current_user
   end
 
   pipeline :api do
     plug :accepts, ["json"]
   end
 
+  # -------------------- Public routes --------------------
   scope "/", DistributerWeb do
     pipe_through :browser
 
-    get "/", PageController, :home
+    live_session :public,
+      on_mount: [{DistributerWeb.UserAuth, :mount_current_user}] do
+      live "/", HomeLive
+      live "/upload", UploadLive
+      live "/shops/:slug", ShopShowLive
+    end
   end
 
-  # Other scopes may use custom stacks.
-  # scope "/api", DistributerWeb do
-  #   pipe_through :api
-  # end
+  # -------------------- Auth routes (guest-only) --------------------
+  scope "/", DistributerWeb do
+    pipe_through [:browser, :redirect_if_user_is_authenticated]
 
-  # Enable LiveDashboard in development
+    get "/users/register", UserRegistrationController, :new
+    post "/users/register", UserRegistrationController, :create
+    get "/users/log_in", UserSessionController, :new
+    post "/users/log_in", UserSessionController, :create
+  end
+
+  # -------------------- Authenticated routes --------------------
+  scope "/", DistributerWeb do
+    pipe_through [:browser, :require_authenticated_user]
+
+    delete "/users/log_out", UserSessionController, :delete
+
+    live_session :authenticated,
+      on_mount: [{DistributerWeb.UserAuth, :ensure_authenticated}] do
+      live "/orders/new", OrderNewLive
+      live "/orders/:id", OrderShowLive
+      live "/sellers/onboarding", SellerOnboardingLive
+    end
+
+    live_session :seller,
+      on_mount: [{DistributerWeb.UserAuth, :ensure_seller}] do
+      live "/sellers", SellerDashboardLive
+      live "/sellers/printers/new", SellerPrinterNewLive
+      live "/sellers/spools/new", SellerSpoolNewLive
+    end
+  end
+
+  # -------------------- Webhooks (API) --------------------
+  scope "/webhooks", DistributerWeb do
+    pipe_through :api
+
+    post "/stripe", StripeWebhookController, :create
+  end
+
+  # -------------------- Dev routes --------------------
   if Application.compile_env(:distributer, :dev_routes) do
-    # If you want to use the LiveDashboard in production, you should put
-    # it behind authentication and allow only admins to access it.
-    # If your application does not have an admins-only section yet,
-    # you can use Plug.BasicAuth to set up some basic authentication
-    # as long as you are also using SSL (which you should anyway).
     import Phoenix.LiveDashboard.Router
 
     scope "/dev" do
