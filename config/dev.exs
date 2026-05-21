@@ -55,9 +55,13 @@ config :distributer, :packeta,
   api_password: System.get_env("PACKETA_API_PASSWORD") || "packeta_placeholder",
   sender_label: System.get_env("PACKETA_SENDER_LABEL") || "distributer-cz"
 
-config :distributer, :claude,
-  api_key: System.get_env("ANTHROPIC_API_KEY") || "sk-ant-placeholder",
-  model: "claude-opus-4-7"
+config :distributer, :ollama,
+  # Ollama Cloud: "https://ollama.com" with an API key.
+  # Local Ollama: "http://localhost:11434" (no api_key needed).
+  # Leave base_url unset/empty to disable AI calls and use stubs.
+  base_url: System.get_env("OLLAMA_BASE_URL") || "",
+  api_key: System.get_env("OLLAMA_API_KEY") || "",
+  model: System.get_env("OLLAMA_MODEL") || "gemini-3-flash-preview"
 
 config :distributer, :slicer,
   binary: System.get_env("PRUSASLICER_BIN") || "prusa-slicer",

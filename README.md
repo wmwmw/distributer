@@ -8,7 +8,7 @@ set their markup, and operate an individual storefront. The platform takes a
 ## What's here
 
 Phase 1 vertical slice. End-to-end path through every domain context, with
-real integrations (Stripe Connect, Packeta, Claude API) wired to stubs in dev.
+real integrations (Stripe Connect, Packeta, Ollama) wired to stubs in dev.
 
 **Implemented**
 
@@ -27,10 +27,12 @@ real integrations (Stripe Connect, Packeta, Claude API) wired to stubs in dev.
 - Seller dashboard: printers, spools, orders, accept / start / ship actions
 - Order state machine: `quoted → paid → accepted → printing → printed →
   shipped → delivered → released` with escrow held until delivered
-- Three Claude API endpoints (material recommender, intent → quality params,
-  geometry anomaly check) — all use structured JSON output, adaptive thinking,
-  prompt caching. LLM never emits raw slicer params — only chooses from
-  constrained spaces. All AI calls logged for audit.
+- Three Ollama endpoints (material recommender, intent → quality params,
+  geometry anomaly check) — all use structured JSON output via Ollama's
+  `format` schema constraint. LLM never emits raw slicer params — only
+  chooses from constrained spaces. All AI calls logged for audit.
+  Configurable backend: Ollama Cloud (`gemini-3-flash-preview`), local
+  `ollama serve`, or any compatible endpoint.
 - Phoenix LiveView UI throughout — real-time slicer-completion updates via
   Phoenix.PubSub
 - Background workers via Oban: mesh analysis, slicing, payments, shipping, AI
@@ -43,8 +45,8 @@ real integrations (Stripe Connect, Packeta, Claude API) wired to stubs in dev.
   buyer "place order" button flips the order to `paid` directly via
   `Payments.stub_mark_paid/1`.
 - Packeta — placeholder password returns synthetic labels with random tracking.
-- Claude API — placeholder key returns deterministic stubs so the rest of the
-  flow runs without an Anthropic account.
+- Ollama — when `OLLAMA_BASE_URL` is unset, AI endpoints return
+  deterministic stubs so the rest of the flow runs without an LLM backend.
 - Mesh analysis — binary STL bbox only. ASCII STL + 3MF + watertight checks
   defer to a `trimesh` Python sidecar (not implemented in phase 1).
 - Stripe webhook signature verification — controller accepts unsigned events.
@@ -58,9 +60,9 @@ real integrations (Stripe Connect, Packeta, Claude API) wired to stubs in dev.
   shipping, ai)
 - **Bandit** HTTP server
 - **PrusaSlicer CLI** for slicing
-- **Req** for HTTP (Stripe, Packeta, Claude API)
-- **Claude API** (`claude-opus-4-7`) for AI recommendations, via REST + adaptive
-  thinking + structured JSON output
+- **Req** for HTTP (Stripe, Packeta, Ollama)
+- **Ollama** for AI recommendations — default cloud model
+  `gemini-3-flash-preview`, structured JSON output via `format` schema
 
 ## Running locally
 
@@ -100,8 +102,19 @@ Visit http://localhost:4000.
 ### Optional environment
 
 ```bash
-# Claude API — without it, AI endpoints return deterministic stubs
-export ANTHROPIC_API_KEY=sk-ant-...
+# Ollama — without OLLAMA_BASE_URL, AI endpoints return deterministic stubs
+#
+# Option A: Ollama Cloud (Gemini Flash hosted by Ollama)
+export OLLAMA_BASE_URL=https://ollama.com
+export OLLAMA_API_KEY=<your-ollama-cloud-key>
+export OLLAMA_MODEL=gemini-3-flash-preview
+
+# Option B: local Ollama serve
+#   curl -fsSL https://ollama.com/install.sh | sh
+#   ollama pull gemma3:12b
+#   ollama serve
+export OLLAMA_BASE_URL=http://localhost:11434
+export OLLAMA_MODEL=gemma3:12b
 
 # Stripe Connect — without it, the "pay" button bypasses Stripe
 export STRIPE_SECRET_KEY=sk_test_...
@@ -131,7 +144,7 @@ lib/distributer/
   shipping.ex           — Packeta integration
   payments.ex           — Stripe Connect integration
   pricing.ex            — deterministic price computation
-  ai.ex                 — Claude API client (3 narrow endpoints)
+  ai.ex                 — Ollama client (3 narrow endpoints)
 ```
 
 ### The slicing pipeline
@@ -139,7 +152,7 @@ lib/distributer/
 ```
 1. Buyer uploads STL/3MF                      → Slicing.create_upload/2
 2. Mesh analyzed (bbox, volume)               → Oban: AnalyzeUploadWorker
-3. AI recommends material (Claude API)        → AI.recommend_material/3
+3. AI recommends material (Ollama)            → AI.recommend_material/3
 4. AI maps intent → quality/infill/walls      → AI.match_intent_to_quality/2
 5. Capable shops filtered (bed size, stock)   → Catalog.find_capable_shops/4
 6. Buyer picks shop / printer / spool / tier  → LiveView form

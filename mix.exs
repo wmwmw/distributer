@@ -56,7 +56,7 @@ defmodule Distributer.MixProject do
       # Background jobs
       {:oban, "~> 2.18"},
 
-      # HTTP client (Stripe, Packeta, Claude API)
+      # HTTP client (Stripe, Packeta, Ollama)
       {:req, "~> 0.5"},
 
       # Decimal math (money)
