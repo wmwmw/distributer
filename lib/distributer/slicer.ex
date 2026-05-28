@@ -39,42 +39,47 @@ defmodule Distributer.Slicer do
     config_path = Path.join(workdir, "config-#{rand_suffix()}.ini")
     output_path = Path.join(workdir, "output-#{rand_suffix()}.gcode")
 
-    File.write!(config_path, to_ini(config))
+    try do
+      File.write!(config_path, to_ini(config))
 
-    bin = Application.get_env(:distributer, :slicer)[:binary] || "prusa-slicer"
+      bin = Application.get_env(:distributer, :slicer)[:binary] || "prusa-slicer"
 
-    args = [
-      "--load", config_path,
-      "--export-gcode",
-      "--output", output_path,
-      input_path
-    ]
+      args = [
+        "--load", config_path,
+        "--export-gcode",
+        "--output", output_path,
+        input_path
+      ]
 
-    Logger.debug("Slicing #{input_path} with #{Enum.join(args, " ")}")
+      Logger.debug("Slicing #{input_path} with #{Enum.join(args, " ")}")
 
-    case System.cmd(bin, args, stderr_to_stdout: true) do
-      {log, 0} ->
-        case File.read(output_path) do
-          {:ok, gcode_bytes} ->
-            {:ok,
-             %{
-               gcode_path: output_path,
-               gcode_bytes: gcode_bytes,
-               grams: extract_grams(gcode_bytes, opts),
-               print_minutes: extract_minutes(gcode_bytes),
-               filament_length_mm: extract_length(gcode_bytes),
-               log: log
-             }}
+      case System.cmd(bin, args, stderr_to_stdout: true) do
+        {log, 0} ->
+          case File.read(output_path) do
+            {:ok, gcode_bytes} ->
+              {:ok,
+               %{
+                 gcode_path: output_path,
+                 gcode_bytes: gcode_bytes,
+                 grams: extract_grams(gcode_bytes, opts),
+                 print_minutes: extract_minutes(gcode_bytes),
+                 filament_length_mm: extract_length(gcode_bytes),
+                 log: log
+               }}
 
-          {:error, reason} ->
-            {:error, {:gcode_read_failed, reason}, log}
-        end
+            {:error, reason} ->
+              {:error, {:gcode_read_failed, reason}, log}
+          end
 
-      {log, exit_code} ->
-        {:error, {:slicer_failed, exit_code}, log}
+        {log, exit_code} ->
+          {:error, {:slicer_failed, exit_code}, log}
+      end
+    after
+      # Always clean up the scratch config + gcode, even on failure, so the
+      # slicer workdir doesn't grow unbounded.
+      File.rm(config_path)
+      File.rm(output_path)
     end
-  after
-    :ok
   end
 
   # ----- Intent param translation -----
@@ -86,8 +91,8 @@ defmodule Distributer.Slicer do
   def merge_intent(base, params) do
     overrides =
       %{}
-      |> maybe_put(params, :infill_percent, "fill_density", &"#{&1}%")
-      |> maybe_put(params, :walls, "perimeters", &to_string/1)
+      |> maybe_put(params, :infill_percent, "fill_density", &"#{clamp_int(&1, 0, 100)}%")
+      |> maybe_put(params, :walls, "perimeters", &to_string(clamp_int(&1, 1, 10)))
       |> maybe_put(params, :supports, "support_material", &if(&1, do: "1", else: "0"))
 
     Map.merge(base, overrides)
@@ -100,18 +105,38 @@ defmodule Distributer.Slicer do
     end
   end
 
+  # Coerce intent values to a bounded integer so they can never carry
+  # arbitrary text into the generated INI.
+  defp clamp_int(v, lo, hi) do
+    n =
+      cond do
+        is_integer(v) -> v
+        is_float(v) -> trunc(v)
+        is_binary(v) -> with {i, _} <- Integer.parse(v), do: i, else: (_ -> lo)
+        true -> lo
+      end
+
+    n |> max(lo) |> min(hi)
+  end
+
   # ----- INI serialization -----
 
   def to_ini(map) when is_map(map) do
     map
-    |> Enum.map(fn {k, v} -> "#{k} = #{ini_value(v)}" end)
+    |> Enum.map(fn {k, v} -> "#{ini_token(k)} = #{ini_value(v)}" end)
     |> Enum.join("\n")
   end
 
   defp ini_value(true), do: "1"
   defp ini_value(false), do: "0"
-  defp ini_value(v) when is_list(v), do: Enum.join(v, ",")
-  defp ini_value(v), do: to_string(v)
+  defp ini_value(v) when is_list(v), do: v |> Enum.map_join(",", &ini_token/1)
+  defp ini_value(v), do: ini_token(v)
+
+  # Strip CR/LF so a value can never inject extra INI directives (e.g. a
+  # rogue `post_process` script) onto their own line.
+  defp ini_token(v) do
+    v |> to_string() |> String.replace(["\n", "\r"], " ")
+  end
 
   # ----- Gcode output parsing -----
 

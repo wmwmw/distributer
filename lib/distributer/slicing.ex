@@ -92,22 +92,34 @@ defmodule Distributer.Slicing do
         material_density: density,
         filament_diameter_mm: diameter
       }) do
-    with {:ok, bytes} <- Storage.get(upload.storage_key),
-         input_path <- write_temp(bytes, upload.format),
-         {:ok, result} <-
-           Distributer.Slicer.slice(input_path, config, intent,
-             material_density: density,
-             filament_diameter_mm: diameter
-           ) do
-      gcode_key = Storage.new_key("gcode", "gcode")
-      {:ok, _} = Storage.put(gcode_key, result.gcode_bytes)
+    with {:ok, bytes} <- Storage.get(upload.storage_key) do
+      input_path = write_temp(bytes, upload.format)
 
-      {:ok, Map.put(result, :gcode_storage_key, gcode_key)}
+      try do
+        with {:ok, result} <-
+               Distributer.Slicer.slice(input_path, config, intent,
+                 material_density: density,
+                 filament_diameter_mm: diameter
+               ) do
+          gcode_key = Storage.new_key("gcode", "gcode")
+          {:ok, _} = Storage.put(gcode_key, result.gcode_bytes)
+
+          {:ok, Map.put(result, :gcode_storage_key, gcode_key)}
+        end
+      after
+        File.rm(input_path)
+      end
     end
   end
 
+  # Only ever build a temp filename from a known-good extension so the format
+  # field (derived from a user filename) can't smuggle path separators or
+  # leading dashes into the slicer invocation.
+  @allowed_formats ~w(stl 3mf)
+
   defp write_temp(bytes, ext) do
-    path = Path.join(System.tmp_dir!(), "input-#{System.unique_integer([:positive])}.#{ext}")
+    safe_ext = if ext in @allowed_formats, do: ext, else: "stl"
+    path = Path.join(System.tmp_dir!(), "input-#{System.unique_integer([:positive])}.#{safe_ext}")
     File.write!(path, bytes)
     path
   end

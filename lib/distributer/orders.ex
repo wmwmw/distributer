@@ -39,16 +39,13 @@ defmodule Distributer.Orders do
   subscribes to PubSub and re-renders when the slicer completes.
   """
   def create_quote(attrs) do
-    {:ok, quote} =
-      %Quote{}
-      |> Quote.changeset(attrs)
-      |> Repo.insert()
+    with {:ok, quote} <- %Quote{} |> Quote.changeset(attrs) |> Repo.insert() do
+      %{quote_id: quote.id}
+      |> Distributer.Orders.SliceQuoteWorker.new()
+      |> Oban.insert()
 
-    %{quote_id: quote.id}
-    |> Distributer.Orders.SliceQuoteWorker.new()
-    |> Oban.insert()
-
-    {:ok, quote}
+      {:ok, quote}
+    end
   end
 
   def update_quote_with_slice_result(%Quote{} = quote, slice_result, shipping_cents \\ 0) do
@@ -135,15 +132,15 @@ defmodule Distributer.Orders do
     }
 
     Repo.transaction(fn ->
-      {:ok, order} =
-        %Order{}
-        |> Order.create_changeset(attrs)
-        |> Repo.insert()
+      order =
+        case %Order{} |> Order.create_changeset(attrs) |> Repo.insert() do
+          {:ok, order} -> order
+          {:error, changeset} -> Repo.rollback(changeset)
+        end
 
-      {:ok, _} =
-        quote
-        |> Quote.changeset(%{status: "converted"})
-        |> Repo.update()
+      quote
+      |> Quote.changeset(%{status: "converted"})
+      |> Repo.update!()
 
       order
     end)
@@ -151,9 +148,22 @@ defmodule Distributer.Orders do
 
   def place_order(_quote, _buyer, _params), do: {:error, :quote_not_sliced}
 
-  def mark_paid(%Order{} = order, %{stripe_payment_intent_id: pi, stripe_charge_id: charge}) do
+  @doc """
+  Mark an order paid, from a confirmed Stripe payment or the dev stub.
+
+  Idempotent and single-shot: a replayed/duplicate webhook for an order that
+  is already paid returns `{:ok, order}` without creating a second print job,
+  and only one print job is ever created per order. Only transitions from
+  `quoted`; any other source status returns `{:error, :invalid_state}`.
+  """
+  def mark_paid(%Order{status: "paid"} = order, _attrs), do: {:ok, order}
+
+  def mark_paid(%Order{status: "quoted"} = order, %{
+        stripe_payment_intent_id: pi,
+        stripe_charge_id: charge
+      }) do
     Repo.transaction(fn ->
-      {:ok, updated} =
+      updated =
         order
         |> Order.state_changeset(%{
           status: "paid",
@@ -161,12 +171,12 @@ defmodule Distributer.Orders do
           stripe_charge_id: charge,
           paid_at: DateTime.utc_now()
         })
-        |> Repo.update()
+        |> Repo.update!()
 
-      # Create the print_job referencing the cached gcode from the quote.
-      quote = get_quote!(order.quote_id)
+      # One print job per order — guard against duplicate webhook deliveries.
+      unless Repo.exists?(from j in PrintJob, where: j.order_id == ^order.id) do
+        quote = get_quote!(order.quote_id)
 
-      {:ok, _job} =
         %PrintJob{}
         |> PrintJob.changeset(%{
           order_id: order.id,
@@ -175,7 +185,8 @@ defmodule Distributer.Orders do
           gcode_storage_key: quote.gcode_storage_key,
           status: "queued"
         })
-        |> Repo.insert()
+        |> Repo.insert!()
+      end
 
       Phoenix.PubSub.broadcast(
         Distributer.PubSub,
@@ -187,69 +198,109 @@ defmodule Distributer.Orders do
     end)
   end
 
-  def accept_order(%Order{status: "paid"} = order) do
-    order
-    |> Order.state_changeset(%{status: "accepted"})
-    |> Repo.update()
+  def mark_paid(%Order{}, _attrs), do: {:error, :invalid_state}
+
+  @doc "Seller accepts a paid order. `shop_id` is the acting seller's shop."
+  def accept_order(%Order{} = order, shop_id) do
+    with :ok <- authorize_shop(order, shop_id),
+         :ok <- require_status(order, "paid") do
+      order
+      |> Order.state_changeset(%{status: "accepted"})
+      |> Repo.update()
+    end
   end
 
-  def start_print(%Order{status: status} = order) when status in ~w(accepted paid) do
-    Repo.transaction(fn ->
-      {:ok, updated} =
-        order
-        |> Order.state_changeset(%{status: "printing"})
-        |> Repo.update()
+  @doc "Seller marks an accepted/paid order as printing. `shop_id` is the acting seller's shop."
+  def start_print(%Order{} = order, shop_id) do
+    with :ok <- authorize_shop(order, shop_id),
+         :ok <- require_status(order, ~w(accepted paid)) do
+      Repo.transaction(fn ->
+        updated =
+          order
+          |> Order.state_changeset(%{status: "printing"})
+          |> Repo.update!()
 
-      job =
-        Repo.one!(from j in PrintJob, where: j.order_id == ^order.id, order_by: [desc: j.inserted_at], limit: 1)
+        job =
+          Repo.one!(
+            from j in PrintJob,
+              where: j.order_id == ^order.id,
+              order_by: [desc: j.inserted_at],
+              limit: 1
+          )
 
-      {:ok, _} =
         job
         |> PrintJob.changeset(%{status: "printing", started_at: DateTime.utc_now()})
-        |> Repo.update()
+        |> Repo.update!()
 
-      updated
-    end)
+        updated
+      end)
+    end
   end
 
-  def complete_print(%Order{} = order, grams_used) do
-    Repo.transaction(fn ->
-      job =
-        Repo.one!(from j in PrintJob, where: j.order_id == ^order.id, order_by: [desc: j.inserted_at], limit: 1)
+  @doc """
+  Seller marks a printing order complete, recording grams of filament used.
+  Atomically decrements the spool; if stock is insufficient the whole
+  transaction is rolled back and `{:error, :insufficient_stock}` is returned.
+  """
+  def complete_print(%Order{} = order, shop_id, grams_used) do
+    with :ok <- authorize_shop(order, shop_id),
+         :ok <- require_status(order, "printing") do
+      Repo.transaction(fn ->
+        job =
+          Repo.one!(
+            from j in PrintJob,
+              where: j.order_id == ^order.id,
+              order_by: [desc: j.inserted_at],
+              limit: 1
+          )
 
-      {:ok, _} =
         job
         |> PrintJob.changeset(%{
           status: "succeeded",
           finished_at: DateTime.utc_now(),
           grams_used: Decimal.new("#{grams_used}")
         })
-        |> Repo.update()
+        |> Repo.update!()
 
-      spool = Inventory.get_spool!(job.material_spool_id)
-      {:ok, _} = Inventory.consume(spool, grams_used, job.id, "auto-decrement on print completion")
+        spool = Inventory.get_spool!(job.material_spool_id)
 
+        # Roll the whole completion back (incl. the job update above) if the
+        # spool can't cover the filament used, so we never oversell stock.
+        case Inventory.consume(spool, grams_used, job.id, "auto-decrement on print completion") do
+          {:ok, _} -> :ok
+          {:error, reason} -> Repo.rollback(reason)
+        end
+
+        order
+        |> Order.state_changeset(%{status: "printed"})
+        |> Repo.update!()
+      end)
+    end
+  end
+
+  @doc "Seller marks a printed order shipped. `shop_id` is the acting seller's shop."
+  def mark_shipped(%Order{} = order, shop_id, %{packeta_label_id: label, tracking_number: tracking}) do
+    with :ok <- authorize_shop(order, shop_id),
+         :ok <- require_status(order, "printed") do
       order
-      |> Order.state_changeset(%{status: "printed"})
-      |> Repo.update!()
-    end)
+      |> Order.state_changeset(%{
+        status: "shipped",
+        packeta_label_id: label,
+        tracking_number: tracking,
+        shipped_at: DateTime.utc_now()
+      })
+      |> Repo.update()
+    end
   end
 
-  def mark_shipped(%Order{} = order, %{packeta_label_id: label, tracking_number: tracking}) do
-    order
-    |> Order.state_changeset(%{
-      status: "shipped",
-      packeta_label_id: label,
-      tracking_number: tracking,
-      shipped_at: DateTime.utc_now()
-    })
-    |> Repo.update()
-  end
-
-  def mark_delivered(%Order{} = order) do
-    order
-    |> Order.state_changeset(%{status: "delivered", delivered_at: DateTime.utc_now()})
-    |> Repo.update()
+  @doc "Buyer confirms delivery of a shipped order. `buyer_id` is the acting user."
+  def mark_delivered(%Order{} = order, buyer_id) do
+    with :ok <- authorize_buyer(order, buyer_id),
+         :ok <- require_status(order, "shipped") do
+      order
+      |> Order.state_changeset(%{status: "delivered", delivered_at: DateTime.utc_now()})
+      |> Repo.update()
+    end
   end
 
   def release_escrow(%Order{status: "delivered"} = order) do
@@ -262,9 +313,25 @@ defmodule Distributer.Orders do
 
   # ----- helpers -----
 
+  defp authorize_shop(%Order{shop_id: shop_id}, shop_id), do: :ok
+  defp authorize_shop(%Order{}, _shop_id), do: {:error, :unauthorized}
+
+  defp authorize_buyer(%Order{buyer_id: buyer_id}, buyer_id), do: :ok
+  defp authorize_buyer(%Order{}, _buyer_id), do: {:error, :unauthorized}
+
+  defp require_status(%Order{status: status}, expected) when is_binary(expected) do
+    if status == expected, do: :ok, else: {:error, :invalid_state}
+  end
+
+  defp require_status(%Order{status: status}, expected) when is_list(expected) do
+    if status in expected, do: :ok, else: {:error, :invalid_state}
+  end
+
   defp generate_order_number do
     year = Date.utc_today().year
-    suffix = :crypto.strong_rand_bytes(3) |> Base.encode16() |> String.slice(0, 5)
+    # 10 hex chars of CSPRNG entropy; collisions are negligible and the
+    # `unique_constraint(:number)` is the backstop if one ever occurs.
+    suffix = :crypto.strong_rand_bytes(5) |> Base.encode16() |> binary_part(0, 10)
     "DST-#{year}-#{suffix}"
   end
 end

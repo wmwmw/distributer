@@ -67,40 +67,69 @@ defmodule Distributer.Inventory do
   @doc """
   Consume `grams` from a spool, recording an immutable spool_event tied to
   the print_job. Transactional: spool decrement + event insert atomic.
+
+  The decrement is a single conditional `UPDATE ... WHERE grams_remaining >=
+  ?`, so concurrent consumes cannot oversell the spool (no lost-update race)
+  and the spool can never go negative. Returns `{:ok, spool}` on success or
+  `{:error, :insufficient_stock}` when there isn't enough filament — in the
+  insufficient case nothing is written. Callers that consume inside their own
+  transaction (e.g. `Orders.complete_print/3`) should `Repo.rollback/1` on the
+  error so their other writes are undone.
   """
   def consume(%MaterialSpool{} = spool, grams, print_job_id, notes \\ nil)
       when is_number(grams) and grams >= 0 do
-    Repo.transaction(fn ->
-      grams_int = trunc(grams)
-      new_remaining = max(spool.grams_remaining - grams_int, 0)
+    grams_int = round(grams)
 
-      updated =
-        spool
-        |> MaterialSpool.changeset(%{grams_remaining: new_remaining})
-        |> Repo.update!()
+    result =
+      Repo.transaction(fn ->
+        # Atomic guarded decrement: only matches the row if enough remains.
+        {count, rows} =
+          Repo.update_all(
+            from(s in MaterialSpool,
+              where: s.id == ^spool.id and s.grams_remaining >= ^grams_int,
+              select: s
+            ),
+            inc: [grams_remaining: -grams_int]
+          )
 
-      %SpoolEvent{}
-      |> SpoolEvent.changeset(%{
-        material_spool_id: spool.id,
-        print_job_id: print_job_id,
-        kind: "consume",
-        grams_delta: Decimal.new("-#{grams_int}"),
-        grams_remaining_after: new_remaining,
-        notes: notes
-      })
-      |> Repo.insert!()
+        case {count, rows} do
+          {1, [updated]} ->
+            %SpoolEvent{}
+            |> SpoolEvent.changeset(%{
+              material_spool_id: spool.id,
+              print_job_id: print_job_id,
+              kind: "consume",
+              grams_delta: Decimal.new("-#{grams_int}"),
+              grams_remaining_after: updated.grams_remaining,
+              notes: notes
+            })
+            |> Repo.insert!()
 
-      updated
-    end)
+            {:ok, updated}
+
+          _ ->
+            # Nothing matched/changed — no rollback needed, just report.
+            {:error, :insufficient_stock}
+        end
+      end)
+
+    case result do
+      {:ok, inner} -> inner
+      {:error, reason} -> {:error, reason}
+    end
   end
 
-  def restock(%MaterialSpool{} = spool, grams, notes \\ nil) do
+  def restock(%MaterialSpool{} = spool, grams, notes \\ nil) when is_number(grams) and grams >= 0 do
+    grams_int = round(grams)
+
     Repo.transaction(fn ->
-      grams_int = trunc(grams)
-      new_remaining = min(spool.grams_remaining + grams_int, spool.grams_total)
+      # Lock the row so a concurrent consume/restock can't clobber the write.
+      current = Repo.one!(from s in MaterialSpool, where: s.id == ^spool.id, lock: "FOR UPDATE")
+      new_remaining = min(current.grams_remaining + grams_int, current.grams_total)
+      applied = new_remaining - current.grams_remaining
 
       updated =
-        spool
+        current
         |> MaterialSpool.changeset(%{grams_remaining: new_remaining})
         |> Repo.update!()
 
@@ -108,7 +137,7 @@ defmodule Distributer.Inventory do
       |> SpoolEvent.changeset(%{
         material_spool_id: spool.id,
         kind: "restock",
-        grams_delta: Decimal.new("#{grams_int}"),
+        grams_delta: Decimal.new("#{applied}"),
         grams_remaining_after: new_remaining,
         notes: notes
       })

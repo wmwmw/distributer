@@ -35,9 +35,16 @@ defmodule DistributerWeb.SellerDashboardLive do
 
   @impl true
   def handle_event("accept-order", %{"id" => id}, socket) do
+    shop = socket.assigns.shop
     order = Orders.get_order!(id)
-    {:ok, _} = Orders.accept_order(order)
-    {:noreply, assign(socket, :orders, Orders.list_orders_for_shop(socket.assigns.shop.id))}
+
+    case Orders.accept_order(order, shop.id) do
+      {:ok, _} ->
+        {:noreply, assign(socket, :orders, Orders.list_orders_for_shop(shop.id))}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, "Could not accept order: #{inspect(reason)}")}
+    end
   end
 
   @impl true

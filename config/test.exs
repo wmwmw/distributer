@@ -20,6 +20,23 @@ config :distributer, DistributerWeb.Endpoint,
   secret_key_base: "tJx62SEpQwHCCJOaa8NMNeg1Uv5IH+bdknQVMSdXFsLqZBPqgrrdzVgT83mU9/6N",
   server: false
 
+# Oban runs in manual mode so enqueued jobs don't execute during tests.
+config :distributer, Oban, testing: :manual
+
+# Integration config — placeholders keep everything in deterministic stub mode.
+config :distributer, :stripe,
+  api_key: "sk_test_placeholder",
+  webhook_secret: "whsec_placeholder",
+  platform_fee_percent: 3
+
+config :distributer, :storage,
+  adapter: Distributer.Storage.Local,
+  upload_dir: "tmp/test_uploads"
+
+config :distributer, :ollama, base_url: "", api_key: "", model: "stub"
+
+config :distributer, :slicer, binary: "prusa-slicer", workdir: "tmp/test_slicer"
+
 # Print only warnings and errors during test
 config :logger, level: :warning
 

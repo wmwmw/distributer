@@ -7,7 +7,7 @@ defmodule DistributerWeb.Endpoint do
   @session_options [
     store: :cookie,
     key: "_distributer_key",
-    signing_salt: "2Vl2OjOn",
+    signing_salt: System.get_env("SESSION_SIGNING_SALT") || "2Vl2OjOn",
     same_site: "Lax"
   ]
 
@@ -44,6 +44,7 @@ defmodule DistributerWeb.Endpoint do
   plug Plug.Parsers,
     parsers: [:urlencoded, :multipart, :json],
     pass: ["*/*"],
+    body_reader: {DistributerWeb.CacheBodyReader, :read_body, []},
     json_decoder: Phoenix.json_library()
 
   plug Plug.MethodOverride

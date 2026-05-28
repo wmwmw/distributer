@@ -5,11 +5,19 @@ defmodule DistributerWeb.SellerPrinterNewLive do
 
   @impl true
   def mount(_params, _session, socket) do
-    shop = Shops.get_shop_for_user(socket.assigns.current_user.id)
-    {:ok,
-     socket
-     |> assign(:shop, shop)
-     |> assign(:printer_models, Catalog.list_printer_models())}
+    case Shops.get_shop_for_user(socket.assigns.current_user.id) do
+      nil ->
+        {:ok,
+         socket
+         |> put_flash(:error, "Create your shop before adding printers.")
+         |> redirect(to: ~p"/sellers/onboarding")}
+
+      shop ->
+        {:ok,
+         socket
+         |> assign(:shop, shop)
+         |> assign(:printer_models, Catalog.list_printer_models())}
+    end
   end
 
   @impl true
@@ -18,7 +26,7 @@ defmodule DistributerWeb.SellerPrinterNewLive do
       "shop_id" => socket.assigns.shop.id,
       "printer_model_id" => params["printer_model_id"],
       "nickname" => params["nickname"],
-      "hourly_rate_cents" => String.to_integer(params["hourly_rate_cents"] || "5000"),
+      "hourly_rate_cents" => parse_int(params["hourly_rate_cents"], 5000),
       "is_active" => true
     }
 
@@ -31,6 +39,13 @@ defmodule DistributerWeb.SellerPrinterNewLive do
 
       {:error, _} ->
         {:noreply, put_flash(socket, :error, "Could not add printer.")}
+    end
+  end
+
+  defp parse_int(value, default) do
+    case value |> to_string() |> String.trim() |> Integer.parse() do
+      {n, ""} when n >= 0 -> n
+      _ -> default
     end
   end
 

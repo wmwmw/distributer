@@ -7,15 +7,24 @@ defmodule DistributerWeb.OrderNewLive do
   def mount(%{"quote_id" => quote_id}, _session, socket) do
     quote = Orders.get_quote!(quote_id)
 
-    case Shipping.lookup_pickup_point("STUB-1") do
-      {:ok, point} ->
-        {:ok,
-         socket
-         |> assign(:quote, quote)
-         |> assign(:default_point, point)}
+    # A quote is bound to whoever uploaded the model. Anonymous uploads
+    # (user_id nil) are claimable by the logged-in buyer, but a quote that
+    # already belongs to a *different* user must not be orderable.
+    upload_owner = quote.upload && quote.upload.user_id
 
-      _ ->
-        {:ok, assign(socket, quote: quote, default_point: nil)}
+    if is_nil(upload_owner) or upload_owner == socket.assigns.current_user.id do
+      socket =
+        case Shipping.lookup_pickup_point("STUB-1") do
+          {:ok, point} -> assign(socket, default_point: point)
+          _ -> assign(socket, default_point: nil)
+        end
+
+      {:ok, assign(socket, :quote, quote)}
+    else
+      {:ok,
+       socket
+       |> put_flash(:error, "That quote belongs to another account.")
+       |> redirect(to: ~p"/")}
     end
   end
 

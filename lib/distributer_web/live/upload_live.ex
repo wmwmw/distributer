@@ -125,35 +125,57 @@ defmodule DistributerWeb.UploadLive do
     spool = Inventory.get_spool!(spool_id)
     material_type = spool.material.type
 
-    canonical =
-      Catalog.find_canonical_profile(shop_printer.printer_model_id, material_type, tier)
+    cond do
+      # The spool and printer must belong to the same shop and both be usable;
+      # otherwise a crafted request could pair an arbitrary spool with a printer.
+      spool.shop_id != shop_printer.shop_id or not shop_printer.is_active or
+          not spool.is_active or spool.grams_remaining <= 0 ->
+        {:noreply, put_flash(socket, :error, "That printer and spool can't be combined.")}
 
-    if canonical do
-      {:ok, quote} =
-        Orders.create_quote(%{
-          upload_id: socket.assigns.upload.id,
-          shop_printer_id: sp_id,
-          material_spool_id: spool_id,
-          canonical_profile_id: canonical.id,
-          infill_percent: String.to_integer(to_string(infill)),
-          walls: String.to_integer(to_string(walls)),
-          supports: supports,
-          quantity: String.to_integer(to_string(qty))
-        })
+      is_nil(parse_int(infill)) or is_nil(parse_int(walls)) or is_nil(parse_int(qty)) ->
+        {:noreply, put_flash(socket, :error, "Infill, walls and quantity must be numbers.")}
 
-      Phoenix.PubSub.subscribe(Distributer.PubSub, "quote:#{quote.id}")
+      true ->
+        canonical =
+          Catalog.find_canonical_profile(shop_printer.printer_model_id, material_type, tier)
 
-      {:noreply,
-       socket
-       |> assign(:quote, quote)
-       |> put_flash(:info, "Quote queued — slicing in progress.")}
-    else
-      {:noreply,
-       put_flash(
-         socket,
-         :error,
-         "No canonical profile for #{material_type} #{tier} on this printer."
-       )}
+        if canonical do
+          case Orders.create_quote(%{
+                 upload_id: socket.assigns.upload.id,
+                 shop_printer_id: sp_id,
+                 material_spool_id: spool_id,
+                 canonical_profile_id: canonical.id,
+                 infill_percent: parse_int(infill),
+                 walls: parse_int(walls),
+                 supports: supports,
+                 quantity: parse_int(qty)
+               }) do
+            {:ok, quote} ->
+              Phoenix.PubSub.subscribe(Distributer.PubSub, "quote:#{quote.id}")
+
+              {:noreply,
+               socket
+               |> assign(:quote, quote)
+               |> put_flash(:info, "Quote queued — slicing in progress.")}
+
+            {:error, _changeset} ->
+              {:noreply, put_flash(socket, :error, "Could not create quote — check your inputs.")}
+          end
+        else
+          {:noreply,
+           put_flash(
+             socket,
+             :error,
+             "No canonical profile for #{material_type} #{tier} on this printer."
+           )}
+        end
+    end
+  end
+
+  defp parse_int(value) do
+    case value |> to_string() |> String.trim() |> Integer.parse() do
+      {n, ""} -> n
+      _ -> nil
     end
   end
 

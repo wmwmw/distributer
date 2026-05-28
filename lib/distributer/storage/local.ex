@@ -32,6 +32,16 @@ defmodule Distributer.Storage.Local do
 
   def full_path(key) do
     base = Application.get_env(:distributer, :storage)[:upload_dir] || "priv/uploads"
-    Path.join(base, key)
+    Path.join(base, safe_key(key))
+  end
+
+  # Reject absolute paths and any `..` traversal so a crafted key can never
+  # escape the upload directory.
+  defp safe_key(key) when is_binary(key) do
+    if Path.type(key) != :relative or ".." in Path.split(key) do
+      raise ArgumentError, "unsafe storage key: #{inspect(key)}"
+    end
+
+    key
   end
 end
